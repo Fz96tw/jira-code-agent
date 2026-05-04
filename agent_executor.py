@@ -25,6 +25,8 @@ Rules:
 - You are already inside the working directory. NEVER use cd commands.
 - Use relative paths for all files and commands.
 - Prefer write_file over shell commands that create files (touch, cat, heredoc).
+- NEVER run scripts or programs that require interactive user input (e.g. read, stdin prompts).
+- For validation, use static checks only: bash -n to check syntax, ls to confirm files exist.
 - Return ONLY valid JSON, no markdown fences."""
 
     resp = client.chat.completions.create(
@@ -61,6 +63,9 @@ def execute_plan(plan_text, summary="", description=""):
             cmd = action["command"].strip()
             if cmd.startswith("cd ") or cmd == "cd":
                 results.append(f"⏭️ skipped cd (already in workdir)")
+                continue
+            if cmd.startswith("./") or cmd.startswith("bash ") and not "-n" in cmd:
+                results.append(f"⏭️ skipped direct script execution (no interactive input available): {cmd}")
                 continue
             try:
                 output = subprocess.check_output(
