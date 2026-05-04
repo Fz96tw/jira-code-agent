@@ -1,7 +1,19 @@
+import os
 from flask import Flask, request
-from agent_runtime import run_agent_task, jira_get_issue, jira_get_agent_status
+from agent_runtime import (
+    run_agent_task,
+    jira_get_issue,
+    jira_get_agent_status,
+    jira_get_agent_type,
+    jira_get_execution_context,
+)
+from agent_architect import run_architect_task
 
 app = Flask(__name__)
+
+AGENT_HANDLERS = {
+    "ARCHITECT": run_architect_task,
+}
 
 
 @app.route("/jira/webhook", methods=["POST"])
@@ -31,7 +43,26 @@ def jira_webhook():
         if status in ("Running", "Completed", "Failed"):
             print(f"  Skipping — Agent Status is '{status}'")
             return "skipped", 200
-        run_agent_task(issue_key, summary, description)
+
+        agent_type = jira_get_agent_type(issue_data)
+        print(f"  Agent Type: {agent_type or '(default)'}")
+
+        if agent_type and agent_type.upper() in AGENT_HANDLERS:
+            AGENT_HANDLERS[agent_type.upper()](issue_key, summary, description)
+        else:
+            # Read execution context — populated by architect for child tasks,
+            # empty for standalone tasks (falls back to /tmp/agent-workspace)
+            ctx = jira_get_execution_context(issue_data)
+            workspace = ctx.get("workspace")
+            design_context = None
+            if workspace:
+                design_path = os.path.join(workspace, "DESIGN.md")
+                if os.path.isfile(design_path):
+                    with open(design_path) as f:
+                        design_context = f.read()
+                print(f"  Workspace: {workspace}")
+            run_agent_task(issue_key, summary, description,
+                           workspace=workspace, design_context=design_context)
 
     return "ok", 200
 
