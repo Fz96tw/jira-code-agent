@@ -1,14 +1,18 @@
+import os
 import requests
 import json
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================
-# CONFIG (EDIT THIS)
+# CONFIG
 # =========================
-JIRA_BASE_URL = "https://fz96tw.atlassian.net"
-EMAIL = "fz96tw@gmail.com"
-API_TOKEN = "ATATT3xFfGF0Ibc8robuteLz-SI90yIVHBOtE8vUGniX68wohQ_EUHdgEO79akY3q5vXtj1XozbZTnvtb_0zvl7E2VCbazp1jAFn-D0BPIT3uOZwZUSPQlQOaUqHKPMyYVsXHv1X2kI_Rv97kTeFEkzyl0xN2PuGV9M2DjJcnWFuo5amTXhFBH0=1472E66D"
-PROJECT_LEAD_ACCOUNT_ID = "712020:75fe7e05-edd2-4eb8-9f25-d037985e66b3"
+JIRA_BASE_URL = os.environ["JIRA_BASE_URL"]
+EMAIL = os.environ["JIRA_EMAIL"]
+API_TOKEN = os.environ["JIRA_API_TOKEN"]
+PROJECT_LEAD_ACCOUNT_ID = os.environ["PROJECT_LEAD_ACCOUNT_ID"]
 
 PROJECT_KEY = "AGENT"
 PROJECT_NAME = "Agent Control Plane"
@@ -33,11 +37,9 @@ def request(method, url, payload=None):
         json=payload
     )
 
-    print(f"{method} {url} -> {resp.status_code}")
-    if resp.text:
-        print(resp.text)
-
     if resp.status_code >= 400:
+        print(f"{method} {url} -> {resp.status_code}")
+        print(resp.text)
         raise Exception(resp.text)
 
     return resp.json() if resp.text else {}
@@ -190,7 +192,7 @@ def get_fields():
     return request("GET", "/rest/api/3/field")
 
 
-def get_or_create_field(name):
+def get_or_create_field(name, description, field_type):
     print(f"\n🧠 Field: {name}")
 
     for f in get_fields():
@@ -200,14 +202,76 @@ def get_or_create_field(name):
 
     print("🚀 Creating")
 
-    payload = {
+    data = request("POST", "/rest/api/3/field", {
         "name": name,
-        "description": f"{name} for agent system",
-        "type": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
-    }
-
-    data = request("POST", "/rest/api/3/field", payload)
+        "description": description,
+        "type": field_type,
+    })
     return data["id"]
+
+
+def get_or_create_select_field(name, description, options):
+    field_id = get_or_create_field(name, description, "com.atlassian.jira.plugin.system.customfieldtypes:select")
+
+    # Get the default context so we can add options to it
+    ctx_data = request("GET", f"/rest/api/3/field/{field_id}/context")
+    contexts = ctx_data.get("values", [])
+    if not contexts:
+        print(f"  ⚠️  No context found for {name}, skipping options")
+        return field_id
+    context_id = contexts[0]["id"]
+
+    # Check existing options
+    opt_data = request("GET", f"/rest/api/3/field/{field_id}/context/{context_id}/option")
+    existing = {o["value"] for o in opt_data.get("values", [])}
+
+    missing = [o for o in options if o not in existing]
+    if missing:
+        request("POST", f"/rest/api/3/field/{field_id}/context/{context_id}/option", {
+            "options": [{"value": o} for o in missing]
+        })
+        print(f"  ✅ Added options: {missing}")
+    else:
+        print("  ✅ Options already exist")
+
+    return field_id
+
+
+def get_screen_ids_for_project(project_key):
+    """Find screens whose name starts with the project key (Jira names them 'KEY: ...')."""
+    data = request("GET", "/rest/api/3/screens")
+    screen_ids = []
+    for screen in data.get("values", []):
+        name = screen.get("name", "")
+        if name.upper().startswith(project_key.upper()):
+            print(f"  Found screen: {name} (id={screen['id']})")
+            screen_ids.append(screen["id"])
+    return screen_ids
+
+
+def add_field_to_screen(screen_id, field_id):
+    tabs = request("GET", f"/rest/api/3/screens/{screen_id}/tabs")
+    if not tabs:
+        return
+    tab_id = tabs[0]["id"]
+
+    existing = request("GET", f"/rest/api/3/screens/{screen_id}/tabs/{tab_id}/fields")
+    if any(f["id"] == field_id for f in existing):
+        return
+
+    request("POST", f"/rest/api/3/screens/{screen_id}/tabs/{tab_id}/fields", {"fieldId": field_id})
+    print(f"  ✅ Added {field_id} to screen {screen_id}")
+
+
+def add_fields_to_project_screens(project_key, field_ids):
+    print("\n📋 Adding fields to project screens...")
+    screen_ids = get_screen_ids_for_project(project_key)
+    if not screen_ids:
+        print("⚠️  No screens found — add fields manually in Jira screen config")
+        return
+    for screen_id in screen_ids:
+        for field_id in field_ids:
+            add_field_to_screen(screen_id, field_id)
 
 
 # =========================
@@ -235,11 +299,27 @@ if __name__ == "__main__":
     # 3. Scheme
     scheme_id = create_or_get_scheme(issue_type_ids)
 
-    attach_issue_types_to_scheme(scheme_id, issue_type_ids)
     assign_scheme_to_project(scheme_id, project_id)
 
     # 4. Fields
-    get_or_create_field("Execution Context")
-    get_or_create_field("Agent Output")
+    exec_ctx_id = get_or_create_field(
+        "Execution Context", "JSON payload for agent input",
+        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+    )
+    agent_out_id = get_or_create_field(
+        "Agent Output", "Agent result",
+        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+    )
+    agent_status_id = get_or_create_select_field(
+        "Agent Status", "Execution state of the agent",
+        ["Idle", "Running", "Blocked", "Completed", "Failed"]
+    )
+    agent_type_id = get_or_create_select_field(
+        "Agent Type", "Type of agent",
+        ["Architect", "Coder", "Reviewer", "Tester", "Deployer"]
+    )
+
+    # 5. Add fields to project screens so they appear on issues
+    add_fields_to_project_screens(PROJECT_KEY, [exec_ctx_id, agent_out_id, agent_status_id, agent_type_id])
 
     print("\n🎉 DONE (IDEMPOTENT SETUP COMPLETE)")
